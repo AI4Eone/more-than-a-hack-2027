@@ -44,10 +44,10 @@ Our pipeline (`src/ai4eone_possession_pipeline.py`) resolves all five failure mo
     2. **Sub-Second Takeover Confidence Gate (`>= 60%` + 95% CI Lower Bound `>= 15%`)**: Standard possessions require `>= 1.0s` (`25` frames), eliminating split-second deflections. However, because 3 staggered 1.0s populations shifted by `0.2s` overlap for `0.60s` (`15` frames) during a genuine 1-second takeover, our confidence gate retains short takeovers (`0.60s–0.96s` / `15–24` frames) when population agreement confidence is `>= 60%` (`>= 3/5` populations) with positive 95% CI support (`>= 15%`).
 - **Layer 4: 5-Frame Memory Reliability Anchors & Selective Fallback**:
   - **Per-Frame Kinematic Reliability Assessment**:
-    - **Visible Ball + Team Visibility (`H` / `A` Candidates)**: When the ball is visible in bounds, at least `14` players are tracked on pitch, game tempo is active, one team's player has close control (`<= 2.0m`), and the opposing team's closest player is separated by at least `>= 2.0m`, the frame is marked as a high-reliability `H` or `A` candidate.
-    - **Out-of-Bounds or Confident Unseen Stoppage (`D` Candidates)**: When the ball is visibly out of bounds (`vis & ~in_bounds`), or when the ball is unseen (`~vis`) and confirmed not to be merely occluded behind a player during active play (`mean_player_speed < 1.25 m/s`, `active_phase_count == 0`, and broadcast close-up ratio `> 0.50`), the frame is marked as a high-reliability `D` candidate.
+    - **Visible Ball + Team Visibility (`H` / `A` Candidates)**: When the ball is visible in bounds on a live wide-angle shot (`~b_closeup`), at least `14` players are tracked on pitch, game tempo is active, one team's player has close control (`<= 2.0m`), and the opposing team's closest player is separated by at least `>= 2.0m`, the frame is marked as a high-reliability `H` or `A` candidate.
+    - **Out-of-Bounds, Replay Setup, or Abandoned-Ball Stoppage (`D` Candidates)**: Marked when (a) the ball is visibly out of bounds (`vis & ~in_bounds`), (b) the ball is unseen (`~vis`) and confirmed not to be merely occluded during active play (`mean_player_speed < 1.25 m/s`, `active_phase_count == 0`, and broadcast close-up ratio `> 0.50`), (c) the broadcast director is in a sustained close-up/replay (`cu_sm >= 0.75`) while the opposing team is uninvolved outside the penalty box (`max_dist_sm > 16.0m`, such as during a goal-kick or free-kick setup), or (d) the ball is left uncontested on pitch (`min_dist_sm > 6.0m`, `max_dist_sm > 15.0m`) while players decelerate (`spd_sm < 1.50 m/s`).
   - **5-Frame Rolling Memory (`>= 4 of last 5 frames`)**: Promotes a candidate state (`H`, `A`, or `D`) to a verified **Reliability Anchor** only when it persists across at least `4 of the last 5 frames`.
-  - **Direct Scene Bridging & Selective 5-Population Fallback**: When a scene sits between two identical verified anchors (`H ... H`, `A ... A`, or `D ... D`) separated by `<= 4.0s` (`100` frames) with zero conflicting anchors in between, the entire scene is locked directly to that anchor without interpolation. The 5-Population Confidence-Interval fallback (Layers 2–3) is used **only** where kinematic reliability is poor (contested challenges, long passes in flight, or transitions between opposing anchors).
+  - **Direct Scene Bridging & Selective 5-Population Fallback**: When a scene sits between two identical verified anchors (`H ... H`, `A ... A`, or `D ... D`) separated by `<= 4.0s` (`100` frames) with zero conflicting anchors in between, the entire scene is locked directly to that anchor (`69.8%` of active play across the full match) without interpolation. The 5-Population Confidence-Interval fallback (Layers 2–3) is used **only** on the remaining `30.2%` of frames where kinematic reliability is poor (contested challenges, long passes in flight, or transitions between opposing anchors).
 
 ---
 
@@ -80,14 +80,14 @@ Our pipeline (`src/ai4eone_possession_pipeline.py`) resolves all five failure mo
 
 | Rank | Submission | `spellF1` (Primary) | `macroF1` (Tie-Break) | `f1_H` | `f1_A` | `f1_D` | `transF1` ($\pm 25\text{f}$) | Pred Poss (`GT=17`) | Mean Dur (`GT=14.2s`) | Share Err | Frag (`GT=1.00`) |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **1** | **`AI4Eone`** | **0.5500** | **0.8059** | **0.8201** | **0.8075** | **0.7903** | **0.2632** | **15** | **17.1 s** | **0.003** | **0.90** |
+| **1** | **`AI4Eone`** | **0.5750** | **0.8655** | **0.8579** | **0.8090** | **0.9295** | **0.3158** | **15** | **16.1 s** | **0.017** | **0.90** |
 | 2 | `baseline_smooth125` | 0.4242 | 0.5812 | 0.7864 | 0.8108 | 0.1464 | 0.1667 | 16 | 18.5 s | 0.052 | 0.81 |
 | 3 | `baseline_smooth50` (Floor) | 0.3256 | 0.6207 | 0.7781 | 0.7615 | 0.3225 | 0.0816 | 26 | 10.8 s | 0.048 | 1.43 |
 | 4 | `baseline_smooth25` | 0.2868 | 0.6200 | 0.7620 | 0.7123 | 0.3857 | 0.2034 | 36 | 7.6 s | 0.056 | 1.90 |
 | 5 | `baseline_raw` | 0.0378 | 0.5972 | 0.7290 | 0.6430 | 0.4197 | 0.1410 | 131 | 2.0 s | 0.046 | 6.52 |
 
 ### B. Full-Match Coverage (`199,319` Frames across Half 1 & Half 2)
-- **`AI4Eone.csv`**: `199,319` rows (`0..199318`), `H = 52,533` (`26.4%`), `A = 39,489` (`19.8%`), `D = 66,835` (`33.5%`), `X = 40,462` (`20.3%`).
+- **`AI4Eone.csv`**: `199,319` rows (`0..199318`), `H = 49,279` (`24.7%`), `A = 36,507` (`18.3%`), `D = 73,071` (`36.7%`), `X = 40,462` (`20.3%`).
 
 ---
 

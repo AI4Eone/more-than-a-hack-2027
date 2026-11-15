@@ -586,16 +586,24 @@ def apply_reliability_anchors_and_selective_fallback(
 
     inst_state = np.full(n_frames, -1, dtype=np.int8)
     active_tempo = (spd >= 1.30) | (active_phase_count > 0)
-    h_clear = vis & in_bounds & active_tempo & (dh1 <= d_close) & ((da1 - dh1) >= d_sep) & (n_pl >= min_players)
-    a_clear = vis & in_bounds & active_tempo & (da1 <= d_close) & ((dh1 - da1) >= d_sep) & (n_pl >= min_players)
+    live_gate = vis & in_bounds & active_tempo & (n_pl >= min_players) & (~b_cu)
+    h_clear = live_gate & (dh1 <= d_close) & ((da1 - dh1) >= d_sep)
+    a_clear = live_gate & (da1 <= d_close) & ((dh1 - da1) >= d_sep)
     inst_state[h_clear] = HOME
     inst_state[a_clear] = AWAY
 
     spd_sm = box_smooth(spd, 25)
     cu_sm = box_smooth(b_cu.astype(np.float32), 25)
+    min_dist_both = np.minimum(np.nan_to_num(dh1, nan=99.0), np.nan_to_num(da1, nan=99.0))
+    max_dist_both = np.maximum(np.nan_to_num(dh1, nan=99.0), np.nan_to_num(da1, nan=99.0))
+    min_dist_sm = box_smooth(min_dist_both, 25)
+    max_dist_sm = box_smooth(max_dist_both, 25)
+
     oob_clear = vis & (~in_bounds)
     unseen_stoppage_clear = (~vis) & (spd_sm < 1.25) & (active_phase_count == 0) & (cu_sm > 0.50)
-    inst_state[oob_clear | unseen_stoppage_clear] = DEAD
+    replay_setup_dead = (cu_sm >= 0.75) & (max_dist_sm > 16.0) & (spd_sm < 3.50)
+    abandoned_dead = (min_dist_sm > 6.0) & (spd_sm < 1.50) & (max_dist_sm > 15.0)
+    inst_state[oob_clear | unseen_stoppage_clear | replay_setup_dead | abandoned_dead] = DEAD
 
     # 5-Frame Memory Confirmation (>= 4 of last 5 frames)
     anchor_state = np.full(n_frames, -1, dtype=np.int8)
@@ -639,7 +647,8 @@ def apply_reliability_anchors_and_selective_fallback(
                     alive_m = (sub_out == "H") | (sub_out == "A")
                     sub_out[alive_m] = char_map[st]
                 else:
-                    out[play_start + s_a:play_start + e_a] = "D"
+                    if (e_a - s_a) >= 50 or np.any(out[max(play_start, play_start + s_a - 25):min(h_stop + 1, play_start + e_a + 25)] == "D"):
+                        out[play_start + s_a:play_start + e_a] = "D"
 
         # Clean any micro-fragments (< 0.60s / 15 frames) created at anchor-to-fallback boundaries
         h_alive = (out[play_start:h_stop + 1] == "H") | (out[play_start:h_stop + 1] == "A")
