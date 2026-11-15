@@ -1,4 +1,24 @@
-# More than a Hack 2027 — Phase 1: Ball Possession
+# More than a Hack 2027 — Phase 1: Ball Possession (`AI4Eone` Submission Repository)
+
+## Reproducing Team `AI4Eone`'s Submission (`AI4Eone.csv`)
+
+1. Unpack the official `BAR-ATH` match data bundle into `data/tactical/` and `data/broadcast/`.
+2. Install dependencies (`numpy>=1.20`):
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the deterministic Dual-Camera + 5-Population Confidence-Interval pipeline to regenerate `submissions/AI4Eone.csv` (and `evaluation/results/AI4Eone.csv`) byte-for-byte across all `199,319` frames (~16 seconds on CPU):
+   ```bash
+   python src/ai4eone_possession_pipeline.py
+   ```
+4. Validate the generated file and score it on the public 5-minute slice:
+   ```bash
+   python evaluation/validate_submission.py submissions/AI4Eone.csv
+   python evaluation/run_evaluation.py --bootstrap 1000
+   ```
+- **Technical Report:** See [`AI4Eone.md`](AI4Eone.md) for the complete methodology, compliance statement, asset usage, and possession rules.
+
+---
 
 **Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)
 and the [Mobile World Capital Barcelona](https://www.mwcbarcelona.com)**, at the Talent Arena in Barcelona.
