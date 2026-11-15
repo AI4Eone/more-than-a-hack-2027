@@ -548,6 +548,122 @@ def fuse_5_populations_with_confidence_intervals(
     return out
 
 
+def apply_reliability_anchors_and_selective_fallback(
+    fallback_labels, kin, t_kin, in_bounds, active_phase_count, half_blocks,
+    d_close=2.0, d_sep=2.0, mem_len=5, bridge_s=4.0, min_players=14, min_anchor_frames=15
+):
+    """
+    Reliability-Anchor + 5-Frame Memory + Selective 5-Population Fallback:
+      1. Frame Reliability Assessment:
+         - Visible Ball + Team Visibility (`n_players >= 14`):
+           Marks a frame as a high-reliability Home (`H`) or Away (`A`) candidate when the ball is
+           visible in bounds, game tempo is active, one team's nearest player is within `d_close <= 2.0m`,
+           and the opposing team's nearest player is separated by at least `d_sep >= 2.0m`.
+         - Out-of-Bounds or Confident Unseen Stoppage (`D`):
+           Marks a frame as a high-reliability Dead Ball (`D`) candidate when the ball is visibly
+           out of bounds (`vis & ~in_bounds`), OR when the ball is unseen (`~vis`) and confirmed not to be
+           merely occluded during live play (`mean_player_speed < 1.25 m/s`, `active_phase_count == 0`,
+           and broadcast close-up ratio `> 0.50`).
+      2. 5-Frame Rolling Memory (`mem_len = 5`):
+         Promotes a candidate state (`H`, `A`, or `D`) to a verified Reliability Anchor only when at least
+         `4 of the last 5 frames` (`>= 80%` memory consistency) agree on that exact state.
+      3. Direct Anchor Bridging (Zero Interpolation Needed Between Identical Anchors):
+         Whenever two identical verified anchors (`H ... H`, `A ... A`, or `D ... D`) occur within
+         `bridge_s <= 4.0s` (`100 frames`) with no conflicting anchor in between, locks the entire
+         interval directly to that anchor.
+      4. Selective 5-Population Fallback:
+         Retains the 5-Population Confidence-Interval prediction (`fallback_labels`) ONLY on segments
+         where direct kinematic reliability is poor (contested duels, long aerial passes, or transitions
+         between opposing anchors).
+    """
+    n_frames = len(kin["ball_vis"])
+    vis = kin["ball_vis"]
+    dh1, da1 = kin["min_dist_h"], kin["min_dist_a"]
+    spd = kin["mean_player_speed"]
+    b_cu = kin["b_closeup"]
+    n_pl = t_kin["n_players"]
+    kickoff_2nd = load_smart_tagging.KICKOFF_VIDEO_FRAMES["2nd Half"]
+
+    inst_state = np.full(n_frames, -1, dtype=np.int8)
+    active_tempo = (spd >= 1.30) | (active_phase_count > 0)
+    h_clear = vis & in_bounds & active_tempo & (dh1 <= d_close) & ((da1 - dh1) >= d_sep) & (n_pl >= min_players)
+    a_clear = vis & in_bounds & active_tempo & (da1 <= d_close) & ((dh1 - da1) >= d_sep) & (n_pl >= min_players)
+    inst_state[h_clear] = HOME
+    inst_state[a_clear] = AWAY
+
+    spd_sm = box_smooth(spd, 25)
+    cu_sm = box_smooth(b_cu.astype(np.float32), 25)
+    oob_clear = vis & (~in_bounds)
+    unseen_stoppage_clear = (~vis) & (spd_sm < 1.25) & (active_phase_count == 0) & (cu_sm > 0.50)
+    inst_state[oob_clear | unseen_stoppage_clear] = DEAD
+
+    # 5-Frame Memory Confirmation (>= 4 of last 5 frames)
+    anchor_state = np.full(n_frames, -1, dtype=np.int8)
+    for code in (HOME, AWAY, DEAD):
+        is_c = (inst_state == code).astype(np.float32)
+        csum = np.concatenate(([0.0], np.cumsum(is_c)))
+        idx = np.arange(n_frames)
+        low = np.maximum(0, idx - mem_len + 1)
+        mem_cnt = csum[idx + 1] - csum[low]
+        anchor_state[mem_cnt >= (mem_len - 1)] = code
+
+    out = fallback_labels.copy()
+    char_map = {HOME: "H", AWAY: "A", DEAD: "D"}
+    max_bridge_f = int(bridge_s * 25)
+
+    for half, h_start, h_stop in half_blocks:
+        play_start = kickoff_2nd if half == 2 else h_start
+        a_slice = anchor_state[play_start:h_stop + 1].copy()
+        valid_idx = np.flatnonzero(a_slice != -1)
+        if len(valid_idx) == 0:
+            continue
+
+        # Bridge between identical anchors when no conflicting anchor occurs in between
+        for k in range(len(valid_idx) - 1):
+            i0, i1 = valid_idx[k], valid_idx[k + 1]
+            if a_slice[i0] == a_slice[i1] and (i1 - i0) <= max_bridge_f:
+                if a_slice[i0] in (HOME, AWAY):
+                    if np.sum(out[play_start + i0:play_start + i1] == "D") > 50:
+                        continue
+                a_slice[i0:i1 + 1] = a_slice[i0]
+
+        # Lock verified anchor scenes; preserve Dead Ball boundaries while overriding poor-reliability team labels
+        edges = np.diff(np.concatenate(([-2], a_slice, [-2])))
+        change_pts = np.flatnonzero(edges != 0)
+        for idx_c in range(len(change_pts) - 1):
+            s_a, e_a = change_pts[idx_c], change_pts[idx_c + 1]
+            st = a_slice[s_a]
+            if st in (HOME, AWAY, DEAD) and (e_a - s_a) >= min_anchor_frames:
+                if st in (HOME, AWAY):
+                    sub_out = out[play_start + s_a:play_start + e_a]
+                    alive_m = (sub_out == "H") | (sub_out == "A")
+                    sub_out[alive_m] = char_map[st]
+                else:
+                    out[play_start + s_a:play_start + e_a] = "D"
+
+        # Clean any micro-fragments (< 0.60s / 15 frames) created at anchor-to-fallback boundaries
+        h_alive = (out[play_start:h_stop + 1] == "H") | (out[play_start:h_stop + 1] == "A")
+        al_edges = np.diff(np.concatenate(([0], h_alive.astype(np.int8), [0])))
+        for as_, ae in zip(np.flatnonzero(al_edges == 1), np.flatnonzero(al_edges == -1)):
+            seg = np.where(out[play_start + as_:play_start + ae] == "H", HOME, AWAY)
+            changed = True
+            while changed:
+                changed = False
+                breaks = np.flatnonzero(seg[1:] != seg[:-1]) + 1
+                bounds = np.concatenate(([0], breaks, [len(seg)]))
+                if len(bounds) <= 2:
+                    break
+                lengths = np.diff(bounds)
+                shortest_idx = int(np.argmin(lengths))
+                if lengths[shortest_idx] < min_anchor_frames:
+                    s_sub, e_sub = bounds[shortest_idx], bounds[shortest_idx + 1]
+                    seg[s_sub:e_sub] = seg[s_sub - 1] if shortest_idx > 0 else seg[e_sub]
+                    changed = True
+            out[play_start + as_:play_start + ae] = np.where(seg == HOME, "H", "A")
+
+    return out
+
+
 def write_submission(path, labels):
     """Write a validated 199,319-row frame,label CSV."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -558,7 +674,7 @@ def write_submission(path, labels):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AI4Eone Evolved Dual-Camera 5-Population Pipeline")
+    parser = argparse.ArgumentParser(description="AI4Eone Evolved Dual-Camera Reliability-Anchor + 5-Population Pipeline")
     parser.add_argument("--out-dir", default=os.path.join(PROJECT_ROOT, "submissions"),
                         help="Directory to write candidate submission CSVs")
     parser.add_argument("--eval-dir", default=os.path.join(REPO_ROOT, "evaluation", "results"),
@@ -575,7 +691,7 @@ def main():
     pitch = GAMES[GAME]["pitch"]
     half_blocks = half_video_blocks(GAME)
 
-    print(f"[1/4] Streaming full-match Tactical ATD ({n_t} frames) & Broadcast ATD ({n_b} frames)...")
+    print(f"[1/5] Streaming full-match Tactical ATD ({n_t} frames) & Broadcast ATD ({n_b} frames)...")
     t_team = load_team_of_each_track(t_paths["atd_meta"])
     b_team = load_team_of_each_track(b_paths["atd_meta"])
     t_kin = parse_atd_kinematics(t_paths["atd_raw"], t_team, n_t, pitch)
@@ -583,12 +699,12 @@ def main():
     _, b_err, b_valid = load_homography.load(GAME, source="broadcast")
     print(f"      Parsed both full-match camera feeds in {time.time() - t0:.1f}s.")
 
-    print("[2/4] Aligning Broadcast multi-camera angles to Tactical timeline & filtering valid wide shots...")
+    print("[2/5] Aligning Broadcast multi-camera angles to Tactical timeline & filtering valid wide shots...")
     fused_kin = align_and_fuse_broadcast_camera(t_kin, b_kin, b_valid, b_err, half_blocks)
     rec_cnt = int(fused_kin["ball_vis"].sum()) - int(t_kin["ball_vis"].sum())
     print(f"      Synchronized lags: {fused_kin['lags']} | Recovered +{rec_cnt} missing ball frames from wide Broadcast angles.")
 
-    print("[3/4] Extracting Smart Tagging tactical phase priors & running 5 Phase-Shifted 1.0s Populations...")
+    print("[3/5] Extracting Smart Tagging tactical phase priors & running 5 Phase-Shifted 1.0s Populations...")
     prior_diff, active_phase_count, _ = build_smart_tagging_signals(n_t, GAME)
     offsets = [(0, "Pop1_0.0s"), (5, "Pop2_0.2s"), (10, "Pop3_0.4s"), (15, "Pop4_0.6s"), (20, "Pop5_0.8s")]
     dc_ev, dc_inb = compute_instantaneous_evidence(fused_kin, prior_diff, pitch)
@@ -597,17 +713,23 @@ def main():
         lbls = run_single_1s_population(off_f, fused_kin, dc_ev, dc_inb, active_phase_count, half_blocks, pitch)
         dc_pop_list.append(lbls)
 
-    print("[4/4] Fusing the 5 Populations with 95% Confidence Intervals & Statistical Laws across all 199,319 frames...")
+    print("[4/5] Computing 5-Population 95% Confidence Interval fallback across all 199,319 frames...")
     dc_conf_labels = fuse_5_populations_with_confidence_intervals(
         dc_pop_list, fused_kin, dc_ev, dc_inb, half_blocks,
         live_conf_pct_gate=80.0, takeover_conf_pct_gate=60.0,
         min_d_frames=75, min_short_poss_frames=15, min_std_poss_frames=25
     )
 
-    sub_path = write_submission(os.path.join(args.out_dir, "AI4Eone.csv"), dc_conf_labels)
+    print("[5/5] Locking 5-Frame Memory Reliability Anchors & applying 5-Population fallback only where reliability is poor...")
+    final_labels = apply_reliability_anchors_and_selective_fallback(
+        dc_conf_labels, fused_kin, t_kin, dc_inb, active_phase_count, half_blocks,
+        d_close=2.0, d_sep=2.0, mem_len=5, bridge_s=4.0, min_players=14, min_anchor_frames=15
+    )
+
+    sub_path = write_submission(os.path.join(args.out_dir, "AI4Eone.csv"), final_labels)
     if args.eval_dir and os.path.isdir(os.path.dirname(os.path.abspath(args.eval_dir))):
-        write_submission(os.path.join(args.eval_dir, "AI4Eone.csv"), dc_conf_labels)
-    counts = {k: int(np.sum(dc_conf_labels == k)) for k in ("H", "A", "D", "X")}
+        write_submission(os.path.join(args.eval_dir, "AI4Eone.csv"), final_labels)
+    counts = {k: int(np.sum(final_labels == k)) for k in ("H", "A", "D", "X")}
     print(f"  -> AI4Eone.csv | H={counts['H']:>6}  A={counts['A']:>6}  D={counts['D']:>6}  X={counts['X']:>6} | saved to {sub_path}")
 
     if args.evaluate:
@@ -616,10 +738,10 @@ def main():
         gt_path = os.path.join(REPO_ROOT, "evaluation", "gt", f"{GAME}_possession_gt_public.csv")
         if os.path.isfile(gt_path):
             gt_codes = pm.label_codes(pm.read_label_csv(gt_path))
-            r_dc_conf = pm.evaluate(gt_codes, pm.label_codes(dc_conf_labels), taus=pm.TAUS, bootstrap_n=0)
+            r_final = pm.evaluate(gt_codes, pm.label_codes(final_labels), taus=pm.TAUS, bootstrap_n=0)
             print(
-                f"  -> Public 5-min check: spellF1={r_dc_conf['spell_f1_mean']:.4f}  "
-                f"macroF1={r_dc_conf['macro_f1']:.4f}  f1_D={r_dc_conf['per_class']['D']['f1']:.4f}"
+                f"  -> Public 5-min check: spellF1={r_final['spell_f1_mean']:.4f}  "
+                f"macroF1={r_final['macro_f1']:.4f}  f1_D={r_final['per_class']['D']['f1']:.4f}"
             )
 
 
